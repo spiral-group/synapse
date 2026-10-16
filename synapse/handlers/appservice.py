@@ -394,10 +394,19 @@ class ApplicationServicesHandler:
 
                     elif stream_key == StreamKeyType.TO_DEVICE:
                         assert isinstance(new_token, int)
-                        # Retrieve a list of to-device message events, as well as the
-                        # maximum stream token of the messages we were able to retrieve.
+                        from_key = await self.store.get_type_stream_id_for_appservice(
+                            service, "to_device"
+                        )
+                        # Spiral patch 0004: notifications do not arrive in
+                        # stream order with respect to the messages they
+                        # carry, so one behind the position has nothing left
+                        # to send, and must not move the position back (which
+                        # would send the range again).
+                        if new_token <= from_key:
+                            continue
+
                         to_device_messages = await self._get_to_device_messages(
-                            service, new_token, users
+                            service, from_key, new_token
                         )
                         self.scheduler.enqueue_for_appservice(
                             service, to_device_messages=to_device_messages
@@ -557,8 +566,8 @@ class ApplicationServicesHandler:
     async def _get_to_device_messages(
         self,
         service: ApplicationService,
+        from_key: int,
         new_token: int,
-        users: Collection[str | UserID],
     ) -> list[JsonDict]:
         """
         Given an application service, determine which events it should receive
@@ -567,29 +576,28 @@ class ApplicationServicesHandler:
 
         Args:
             service: The application service to check for which events it should receive.
-            new_token: The latest to-device event stream token.
-            users: The users to be notified for the new to-device messages
-                (ie, the recipients of the messages).
+            from_key: The to-device stream position the appservice has
+                processed up to (exclusive).
+            new_token: The latest to-device event stream token (inclusive).
 
         Returns:
             A list of JSON dictionaries containing data derived from the to-device events
                 that should be sent to the given application service.
         """
-        # Get the stream token that this application service has processed up until
-        from_key = await self.store.get_type_stream_id_for_appservice(
-            service, "to_device"
+        # Spiral patch 0004: every recipient in the range, not just the
+        # `users` of the notification being handled. A send notifies with the
+        # stream's persisted-up-to token, which is below its own stream id
+        # while a lower id is still being written. Its notification then
+        # reads up to a token short of its own message, and the notification
+        # of the lower id's send — whose `users` are that send's recipients
+        # only — takes the position past it. Reading the recipients from the
+        # range itself delivers each message in the range exactly once.
+        recipients = await self.store.get_local_to_device_recipients_between(
+            from_key, new_token
         )
-
-        # Filter out users that this appservice is not interested in
-        users_appservice_is_interested_in: list[str] = []
-        for user in users:
-            # FIXME: We should do this farther up the call stack. We currently repeat
-            #  this operation in _handle_presence.
-            if isinstance(user, UserID):
-                user = user.to_string()
-
-            if service.is_interested_in_user(user):
-                users_appservice_is_interested_in.append(user)
+        users_appservice_is_interested_in = [
+            user for user in recipients if service.is_interested_in_user(user)
+        ]
 
         if not users_appservice_is_interested_in:
             # Return early if the AS was not interested in any of these users

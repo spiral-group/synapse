@@ -677,6 +677,36 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             "delete_device_msgs_for_remote", delete_messages_for_remote_destination_txn
         )
 
+    async def get_local_to_device_recipients_between(
+        self, from_stream_id: int, to_stream_id: int
+    ) -> set[str]:
+        """The local users with a to-device message in the device inbox whose
+        stream id lies in the given range (from < X <= to).
+
+        Spiral patch 0004: an appservice uses this to find every recipient in
+        the range it is about to acknowledge, rather than only the recipients
+        of the send whose notification it is handling.
+        """
+        if to_stream_id <= from_stream_id:
+            return set()
+
+        def get_local_to_device_recipients_between_txn(
+            txn: LoggingTransaction,
+        ) -> set[str]:
+            # `device_inbox_stream_id_user_id` covers (stream_id, user_id).
+            txn.execute(
+                "SELECT DISTINCT user_id FROM device_inbox"
+                " WHERE ? < stream_id AND stream_id <= ?",
+                (from_stream_id, to_stream_id),
+            )
+            return {row[0] for row in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_local_to_device_recipients_between",
+            get_local_to_device_recipients_between_txn,
+            db_autocommit=True,  # A single read.
+        )
+
     async def get_all_new_device_messages(
         self, instance_name: str, last_id: int, current_id: int, limit: int
     ) -> tuple[list[tuple[int, tuple]], int, bool]:
