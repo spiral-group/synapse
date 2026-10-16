@@ -35,6 +35,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Spiral (decision 167): spec versions we advertise on top of the list the
+# Rust handler builds (which stops at v1.12 in 1.158). v1.13's one new
+# client endpoint, `POST /v3/rooms/{roomId}/report` (MSC4151), is already
+# served here, but only at the stable path; a client that reads v1.12 posts
+# the unstable path and gets a 404. Its other v1.13 changes are error codes
+# and clarifications Synapse already follows.
+SPIRAL_EXTRA_VERSIONS = ("v1.13",)
+
 
 class VersionsRestServlet(RestServlet):
     PATTERNS = [re.compile("^/_matrix/client/versions$")]
@@ -79,6 +87,9 @@ class VersionsRestServlet(RestServlet):
         request.setHeader(b"Vary", b"Authorization")
 
         versions_response_body = await self.rust_handlers.versions.get_versions(user_id)
+        for version in SPIRAL_EXTRA_VERSIONS:
+            if version not in versions_response_body["versions"]:
+                versions_response_body["versions"].append(version)
 
         return (
             200,
