@@ -784,6 +784,7 @@ class SlidingSyncRestServlet(RestServlet):
     PATTERNS = client_patterns(
         "/org.matrix.simplified_msc3575/sync$", releases=[], v1=False, unstable=True
     )
+    ALLOWED_PRESENCE = SyncRestServlet.ALLOWED_PRESENCE
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -793,6 +794,14 @@ class SlidingSyncRestServlet(RestServlet):
         self.filtering = hs.get_filtering()
         self.sliding_sync_handler = hs.get_sliding_sync_handler()
         self.event_serializer = hs.get_event_client_serializer()
+        self.presence_handler = hs.get_presence_handler()
+
+        # Ratelimiter for presence updates, keyed by requester (as `/sync`).
+        self._presence_per_user_limiter = Ratelimiter(
+            store=self.store,
+            clock=self.clock,
+            cfg=hs.config.ratelimiting.rc_presence_per_user,
+        )
 
     async def on_POST(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req_experimental_feature(
@@ -802,6 +811,16 @@ class SlidingSyncRestServlet(RestServlet):
         user = requester.user
 
         timeout = parse_integer(request, "timeout", default=0)
+        # MSC4186: "Same as in /v3/sync, controls whether the client is
+        # automatically marked as online by polling this API. If this
+        # parameter is omitted then the client is automatically marked as
+        # online when it uses this API."
+        set_presence = parse_string(
+            request,
+            "set_presence",
+            default="online",
+            allowed_values=self.ALLOWED_PRESENCE,
+        )
         # Position in the stream
         from_token_string = parse_string(request, "pos")
 
@@ -856,15 +875,33 @@ class SlidingSyncRestServlet(RestServlet):
             extensions=body.extensions,
         )
 
-        (
-            sliding_sync_results,
-            did_wait,
-        ) = await self.sliding_sync_handler.wait_for_sync_for_user(
-            requester,
-            sync_config,
-            from_token,
-            timeout,
+        # Mark the device as syncing for the duration of the request, exactly
+        # as `/sync` does: this is what keeps a polling client online and
+        # bumps `last_active_ts`. Ignore the presence update if the ratelimit
+        # is exceeded, but do not pause the request.
+        allowed, _ = await self._presence_per_user_limiter.can_do_action(requester)
+        if not allowed:
+            affect_presence = False
+            logger.debug("User set_presence ratelimit exceeded; ignoring it.")
+        else:
+            affect_presence = set_presence != PresenceState.OFFLINE
+
+        context = await self.presence_handler.user_syncing(
+            user.to_string(),
+            requester.device_id,
+            affect_presence=affect_presence,
+            presence_state=set_presence,
         )
+        with context:
+            (
+                sliding_sync_results,
+                did_wait,
+            ) = await self.sliding_sync_handler.wait_for_sync_for_user(
+                requester,
+                sync_config,
+                from_token,
+                timeout,
+            )
         # Knowing whether we waited is useful in traces to filter out long-running
         # requests where we were just waiting.
         set_tag("sliding_sync.did_wait", str(did_wait))
