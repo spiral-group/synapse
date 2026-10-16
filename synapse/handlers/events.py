@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING, Iterable
 from synapse.api.constants import EduTypes, EventTypes, Membership, PresenceState
 from synapse.api.errors import AuthError, SynapseError
 from synapse.events.utils import FilteredEvent
-from synapse.handlers.presence import format_user_presence_state
+from synapse.handlers.presence import (
+    format_user_presence_state,
+    spiral_filter_presence_for_observer,
+)
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.streams.config import PaginationConfig
 from synapse.types import JsonDict, Requester, UserID
@@ -116,6 +119,13 @@ class EventStreamHandler:
                         users = [event.event.state_key]
 
                     states = await presence_handler.get_states(users)
+                    # Spiral (ADR-0084): no presence of a hidden pair on any stream.
+                    states = await spiral_filter_presence_for_observer(
+                        self.store,
+                        self.hs.hostname,
+                        requester.user.to_string(),
+                        states,
+                    )
                     to_add.extend(
                         {
                             "type": EduTypes.PRESENCE,

@@ -32,7 +32,10 @@ from synapse.api.constants import (
 from synapse.api.errors import SynapseError
 from synapse.events.utils import FilteredEvent
 from synapse.events.validator import EventValidator
-from synapse.handlers.presence import format_user_presence_state
+from synapse.handlers.presence import (
+    format_user_presence_state,
+    spiral_filter_presence_for_observer,
+)
 from synapse.handlers.receipts import ReceiptEventSource
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.storage.roommember import RoomsForUser
@@ -467,6 +470,10 @@ class InitialSyncHandler:
                 return []
 
             states = await presence_handler.get_states([m.sender for m in room_members])
+            # Spiral (ADR-0084): no presence of a hidden pair on any stream.
+            states = await spiral_filter_presence_for_observer(
+                self.store, self.hs.hostname, requester.user.to_string(), states
+            )
 
             return [
                 {

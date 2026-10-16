@@ -44,6 +44,7 @@ from synapse.api.presence import UserPresenceState
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.events import EventBase
 from synapse.events.utils import FilteredEvent
+from synapse.handlers.presence import spiral_filter_presence_for_observer
 from synapse.handlers.relations import BundledAggregations
 from synapse.logging import issue9533_logger
 from synapse.logging.context import current_context
@@ -2184,6 +2185,10 @@ class SyncHandler:
 
         if extra_users_ids:
             states = await self.presence_handler.get_states(extra_users_ids)
+            # Spiral (ADR-0084): no presence of a hidden pair on any stream.
+            states = await spiral_filter_presence_for_observer(
+                self.store, self.hs_config.server.server_name, user.to_string(), states
+            )
             presence.extend(states)
 
             # Deduplicate the presence entries so that there's at most one per user

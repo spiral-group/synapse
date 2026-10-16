@@ -1980,6 +1980,95 @@ def format_user_presence_state(
     return content
 
 
+
+# Spiral (ADR-0084): presence privacy as Telegram does it.
+#
+# A user who sets the global account data `com.spiral.presence` to
+# `{"share": false}` shows other users only "offline" and a coarse "last seen"
+# bucket — never the exact time, never "online" — and, reciprocally, sees
+# everyone else the same way. Absent, or anything but `false`, means "share".
+# The server enforces it, so a modified client or a direct API call learns no
+# more than the app shows.
+SPIRAL_PRESENCE_ACCOUNT_DATA_TYPE = "com.spiral.presence"
+SPIRAL_LAST_SEEN_FIELD = "com.spiral.last_seen"
+
+_SPIRAL_DAY_MS = 24 * 60 * 60 * 1000
+
+
+async def spiral_hides_presence(
+    store: DataStore, server_name: str, user_id: str
+) -> bool:
+    """Whether `user_id` (a local user) has turned sharing their presence off."""
+    if get_domain_from_id(user_id) != server_name:
+        return False
+    content = await store.get_global_account_data_by_type_for_user(
+        user_id, SPIRAL_PRESENCE_ACCOUNT_DATA_TYPE
+    )
+    return bool(content) and content.get("share") is False
+
+
+async def spiral_presence_hidden_between(
+    store: DataStore, server_name: str, observed: str, observer: str
+) -> bool:
+    """Whether `observer` may see only the coarse presence of `observed`:
+    either of them hides theirs. Everyone sees their own exactly."""
+    if observed == observer:
+        return False
+    return await spiral_hides_presence(
+        store, server_name, observed
+    ) or await spiral_hides_presence(store, server_name, observer)
+
+
+def spiral_last_seen_bucket(last_active_ts: int, now: int) -> str:
+    """Telegram's buckets: recently (up to ~3 days), within a week, within a
+    month, a long time ago. Counted in whole UTC days, so the moment a user
+    moves from one bucket to the next gives away their day, not their hour."""
+    if not last_active_ts:
+        return "long_ago"
+    days = now // _SPIRAL_DAY_MS - last_active_ts // _SPIRAL_DAY_MS
+    if days < 3:
+        return "recently"
+    if days < 7:
+        return "within_week"
+    if days < 30:
+        return "within_month"
+    return "long_ago"
+
+
+def spiral_coarse_presence(state: UserPresenceState, now: int) -> JsonDict:
+    """What a hidden pair sees instead of `format_user_presence_state`."""
+    return {
+        "presence": PresenceState.OFFLINE,
+        SPIRAL_LAST_SEEN_FIELD: spiral_last_seen_bucket(state.last_active_ts, now),
+    }
+
+
+async def spiral_filter_presence_for_observer(
+    store: DataStore,
+    server_name: str,
+    observer: str,
+    states: Iterable[UserPresenceState],
+) -> list[UserPresenceState]:
+    """Drop from a stream the states `observer` may not see exactly.
+
+    Every place that PUSHES presence (sync, appservices, /events, initial
+    sync) goes through here. Pushing even a redacted state on each change would
+    date the hidden user's activity, so a hidden pair simply gets no updates;
+    the coarse bucket is read with `GET /presence/{userId}/status`.
+    """
+    states = list(states)
+    if await spiral_hides_presence(store, server_name, observer):
+        return [state for state in states if state.user_id == observer]
+    kept = []
+    for state in states:
+        if state.user_id != observer and await spiral_hides_presence(
+            store, server_name, state.user_id
+        ):
+            continue
+        kept.append(state)
+    return kept
+
+
 class PresenceEventSource(EventSource[int, UserPresenceState]):
     def __init__(self, hs: "HomeServer"):
         # We can't call get_presence_handler here because there's a cycle:
@@ -2005,6 +2094,33 @@ class PresenceEventSource(EventSource[int, UserPresenceState]):
         from_key: int | None,
         # Having a default limit doesn't match the EventSource API, but some
         # callers do not provide it. It is unused in this class.
+        limit: int = 0,
+        room_ids: StrCollection | None = None,
+        is_guest: bool = False,
+        explicit_room_id: str | None = None,
+        include_offline: bool = True,
+        service: ApplicationService | None = None,
+    ) -> tuple[list[UserPresenceState], int]:
+        # Spiral (ADR-0084): no presence of a hidden pair on any stream.
+        updates, token = await self._get_new_events_unfiltered(
+            user,
+            from_key,
+            limit=limit,
+            room_ids=room_ids,
+            is_guest=is_guest,
+            explicit_room_id=explicit_room_id,
+            include_offline=include_offline,
+            service=service,
+        )
+        updates = await spiral_filter_presence_for_observer(
+            self.store, self.server_name, user.to_string(), updates
+        )
+        return updates, token
+
+    async def _get_new_events_unfiltered(
+        self,
+        user: UserID,
+        from_key: int | None,
         limit: int = 0,
         room_ids: StrCollection | None = None,
         is_guest: bool = False,
