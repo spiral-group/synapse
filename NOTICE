@@ -1,0 +1,21 @@
+Synapse, Spiral's fork
+Copyright 2026 the Spiral authors.
+
+"The Spiral authors" is Andrii Panasiuk, the individual developer who
+publishes Spiral and holds the copyright in Spiral's changes. Spiral is the
+product's name, not a company.
+
+Source requests: support@spiral.md
+
+This branch is a modified version of Synapse
+(https://github.com/element-hq/synapse), Copyright Element Creations Ltd.,
+New Vector Ltd. and their contributors, licensed under the GNU Affero
+General Public License v3.0 only (LICENSE-AGPL-3.0). LICENSE-COMMERCIAL is
+Element's notice for its own code.
+
+The Spiral authors modified it in 2026, with four patches on top of the
+upstream tag v1.158.0, one commit each; `git log v1.158.0..` lists them
+and `git diff v1.158.0` shows every change. The modified work is
+distributed under the same licence. It is the source of the homeserver
+Spiral's users reach over the network (AGPL-3.0 section 13): the image
+tagged v1.158.0-spiral.4, built with spiral/Dockerfile.
