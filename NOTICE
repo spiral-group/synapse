@@ -13,9 +13,9 @@ New Vector Ltd. and their contributors, licensed under the GNU Affero
 General Public License v3.0 only (LICENSE-AGPL-3.0). LICENSE-COMMERCIAL is
 Element's notice for its own code.
 
-The Spiral authors modified it in 2026, with five patches on top of the
+The Spiral authors modified it in 2026, with six patches on top of the
 upstream tag v1.158.0, one commit each, and one module, spiral/modules/; `git log v1.158.0..` lists them
 and `git diff v1.158.0` shows every change. The modified work is
 distributed under the same licence. It is the source of the homeserver
 Spiral's users reach over the network (AGPL-3.0 section 13): the image
-tagged v1.158.0-spiral.6, built with spiral/Dockerfile.
+tagged v1.158.0-spiral.7, built with spiral/Dockerfile.
