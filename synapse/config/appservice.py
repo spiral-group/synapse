@@ -199,6 +199,12 @@ def _load_appservice(
             "The `io.element.msc4190` option should be true or false if specified."
         )
 
+    spiral_hold_presence = as_info.get("com.spiral.hold_presence", False)
+    if not isinstance(spiral_hold_presence, bool):
+        raise ValueError(
+            "The `com.spiral.hold_presence` option should be true or false if specified."
+        )
+
     return ApplicationService(
         token=as_info["as_token"],
         url=as_info["url"],
@@ -213,4 +219,5 @@ def _load_appservice(
         supports_ephemeral=supports_ephemeral,
         msc3202_transaction_extensions=msc3202_transaction_extensions,
         msc4190_device_management=msc4190_enabled,
+        spiral_hold_presence=spiral_hold_presence,
     )

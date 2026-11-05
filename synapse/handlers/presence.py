@@ -1200,6 +1200,21 @@ class PresenceHandler(BasePresenceHandler):
                         states, destinations
                     )
 
+    def _spiral_presence_is_held(self, user_id: str) -> bool:
+        """Whether this user's presence is held: it stays as it was set, with
+        no idle or offline timeout, until it is set again.
+
+        True for the exclusive users of an application service whose
+        registration says `com.spiral.hold_presence: true`. Such a user has no
+        client that syncs: the service says when it is there and when it is
+        not. The rule reads the registration, not a stored flag, so it holds
+        across a restart, where the state comes back from the database.
+        """
+        return any(
+            service.spiral_hold_presence and service.is_exclusive_user(user_id)
+            for service in self.store.get_app_services()
+        )
+
     @wrap_as_background_process("handle_presence_timeouts")
     async def _handle_timeouts(self) -> None:
         """Checks the presence of users that have timed out and updates as
@@ -1231,6 +1246,13 @@ class PresenceHandler(BasePresenceHandler):
                 )
             )
             self.external_process_last_updated_ms.pop(process_id)
+
+        # Spiral: a held user's presence changes only when it is set.
+        users_to_check = {
+            user_id
+            for user_id in users_to_check
+            if not self._spiral_presence_is_held(user_id)
+        }
 
         states = [
             self.user_to_current_state.get(user_id, UserPresenceState.default(user_id))
