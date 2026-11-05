@@ -76,6 +76,7 @@ from synapse.events import EventBase
 from synapse.logging.context import run_in_background
 from synapse.storage.databases.main import DataStore
 from synapse.types import DeviceListUpdates, JsonMapping
+from synapse.util.async_helpers import Linearizer
 from synapse.util.clock import Clock, DelayedCallWrapper
 from synapse.util.duration import Duration
 
@@ -107,6 +108,11 @@ class ApplicationServiceScheduler:
         self.store = hs.get_datastores().main
         self.queuer = _ServiceQueuer(self.txn_ctrl, hs)
 
+        # Spiral patch 0006: what an appservice must not lose while it is down.
+        self.backlog = _AppserviceBacklog(hs, self.queuer)
+        self.queuer.backlog = self.backlog
+        self.txn_ctrl.backlog = self.backlog
+
     async def start(self) -> None:
         logger.info("Starting appservice scheduler")
 
@@ -118,46 +124,43 @@ class ApplicationServiceScheduler:
         for service in services:
             self.txn_ctrl.start_recoverer(service)
 
+        # Spiral patch 0006: the to-device position is where the appservice
+        # has *received* messages up to, so whatever was still queued in
+        # memory when we stopped is in the device inbox past it.
+        down = {service.id for service in services}
+        for service in self.store.get_app_services():
+            if service.id not in down and self.backlog.wants_to_device(service):
+                self.queuer.wake_for_to_device(service)
+
     def enqueue_for_appservice(
         self,
         appservice: ApplicationService,
         events: Collection[EventBase] | None = None,
         ephemeral: Collection[JsonMapping] | None = None,
-        to_device_messages: Collection[JsonMapping] | None = None,
         device_list_summary: DeviceListUpdates | None = None,
     ) -> None:
         """
         Enqueue some data to be sent off to an application service.
 
+        To-device messages are not queued here: see `wake_for_to_device`.
+
         Args:
             appservice: The application service to create and send a transaction to.
             events: The persistent room events to send.
             ephemeral: The ephemeral events to send.
-            to_device_messages: The to-device messages to send. These differ from normal
-                to-device messages sent to clients, as they have 'to_device_id' and
-                'to_user_id' fields.
             device_list_summary: A summary of users that the application service either needs
                 to refresh the device lists of, or those that the application service need no
                 longer track the device lists of.
         """
         # We purposefully allow this method to run with empty events/ephemeral
         # collections, so that callers do not need to check iterable size themselves.
-        if (
-            not events
-            and not ephemeral
-            and not to_device_messages
-            and not device_list_summary
-        ):
+        if not events and not ephemeral and not device_list_summary:
             return
 
         if events:
             self.queuer.queued_events.setdefault(appservice.id, []).extend(events)
         if ephemeral:
             self.queuer.queued_ephemeral.setdefault(appservice.id, []).extend(ephemeral)
-        if to_device_messages:
-            self.queuer.queued_to_device_messages.setdefault(appservice.id, []).extend(
-                to_device_messages
-            )
         if device_list_summary:
             self.queuer.queued_device_list_summaries.setdefault(
                 appservice.id, []
@@ -165,6 +168,12 @@ class ApplicationServiceScheduler:
 
         # Kick off a new application service transaction
         self.queuer.start_background_request(appservice)
+
+    def wake_for_to_device(self, appservice: ApplicationService) -> None:
+        """Spiral patch 0006: there may be new to-device messages for this
+        application service's users in the device inbox. The sender reads them
+        from the position the application service has received them up to."""
+        self.queuer.wake_for_to_device(appservice)
 
 
 class _ServiceQueuer:
@@ -180,8 +189,10 @@ class _ServiceQueuer:
         self.queued_events: dict[str, list[EventBase]] = {}
         # dict of {service_id: [events]}
         self.queued_ephemeral: dict[str, list[JsonMapping]] = {}
-        # dict of {service_id: [to_device_message_json]}
-        self.queued_to_device_messages: dict[str, list[JsonMapping]] = {}
+        # Spiral patch 0006: the services with to-device messages to read
+        # from the device inbox, and the reader (set by the scheduler).
+        self.to_device_wakeups: set[str] = set()
+        self.backlog: "_AppserviceBacklog | None" = None
         # dict of {service_id: [device_list_summary]}
         self.queued_device_list_summaries: dict[str, list[DeviceListUpdates]] = {}
 
@@ -203,6 +214,10 @@ class _ServiceQueuer:
 
         self.hs.run_as_background_process("as-sender", self._send_request, service)
 
+    def wake_for_to_device(self, service: ApplicationService) -> None:
+        self.to_device_wakeups.add(service.id)
+        self.start_background_request(service)
+
     async def _send_request(self, service: ApplicationService) -> None:
         # sanity-check: we shouldn't get here if this service already has a sender
         # running.
@@ -219,13 +234,8 @@ class _ServiceQueuer:
                 ephemeral = all_events_ephemeral[:MAX_EPHEMERAL_EVENTS_PER_TRANSACTION]
                 del all_events_ephemeral[:MAX_EPHEMERAL_EVENTS_PER_TRANSACTION]
 
-                all_to_device_messages = self.queued_to_device_messages.get(
-                    service.id, []
-                )
-                to_device_messages_to_send = all_to_device_messages[
-                    :MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION
-                ]
-                del all_to_device_messages[:MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION]
+                read_to_device = service.id in self.to_device_wakeups
+                self.to_device_wakeups.discard(service.id)
 
                 # Consolidate any pending device list summaries into a single, up-to-date
                 # summary.
@@ -251,44 +261,92 @@ class _ServiceQueuer:
                 if (
                     not events
                     and not ephemeral
-                    and not to_device_messages_to_send
+                    and not read_to_device
                     # DeviceListUpdates is True if either the 'changed' or 'left' sets have
                     # at least one entry, otherwise False
                     and not device_list_summary
                 ):
                     return
 
-                one_time_keys_count: TransactionOneTimeKeysCount | None = None
-                unused_fallback_keys: TransactionUnusedFallbackKeys | None = None
-
-                if (
-                    self._msc3202_transaction_extensions_enabled
-                    and service.msc3202_transaction_extensions
-                ):
-                    # Compute the one-time key counts and fallback key usage states
-                    # for the users which are mentioned in this transaction,
-                    # as well as the appservice's sender.
-                    (
-                        one_time_keys_count,
-                        unused_fallback_keys,
-                    ) = await self._compute_msc3202_otk_counts_and_fallback_keys(
-                        service, events, ephemeral, to_device_messages_to_send
+                assert self.backlog is not None
+                # Spiral patch 0006: one reader of an appservice's to-device
+                # stream at a time (this sender or its recoverer), from the
+                # read to the stored position.
+                async with self.backlog.lock.queue(service.id):
+                    await self._send_one(
+                        service, events, ephemeral, read_to_device, device_list_summary
                     )
-
-                try:
-                    await self.txn_ctrl.send(
-                        service,
-                        events,
-                        ephemeral,
-                        to_device_messages_to_send,
-                        one_time_keys_count,
-                        unused_fallback_keys,
-                        device_list_summary,
-                    )
-                except Exception:
-                    logger.exception("AS request failed")
         finally:
             self.requests_in_flight.discard(service.id)
+
+    async def _send_one(
+        self,
+        service: ApplicationService,
+        events: list[EventBase],
+        ephemeral: list[JsonMapping],
+        read_to_device: bool,
+        device_list_summary: DeviceListUpdates,
+    ) -> None:
+        assert self.backlog is not None
+        to_device_messages_to_send: list[JsonMapping] = []
+        to_device_upto: int | None = None
+        # While the service is down its recoverer sends the backlog,
+        # and wakes us once it is up again.
+        if read_to_device and await self.txn_ctrl._is_service_up(service):
+            (
+                to_device_messages_to_send,
+                to_device_upto,
+                more,
+            ) = await self.backlog.read_to_device(service)
+            if more:
+                self.to_device_wakeups.add(service.id)
+            if not to_device_messages_to_send and to_device_upto is not None:
+                # Nothing for this service in the range: no need to
+                # read it again.
+                await self.backlog.ack_to_device(service, to_device_upto)
+                to_device_upto = None
+
+        if (
+            not events
+            and not ephemeral
+            and not to_device_messages_to_send
+            and not device_list_summary
+        ):
+            return
+
+        one_time_keys_count: TransactionOneTimeKeysCount | None = None
+        unused_fallback_keys: TransactionUnusedFallbackKeys | None = None
+
+        if (
+            self._msc3202_transaction_extensions_enabled
+            and service.msc3202_transaction_extensions
+        ):
+            # Compute the one-time key counts and fallback key usage states
+            # for the users which are mentioned in this transaction,
+            # as well as the appservice's sender.
+            (
+                one_time_keys_count,
+                unused_fallback_keys,
+            ) = await self._compute_msc3202_otk_counts_and_fallback_keys(
+                service, events, ephemeral, to_device_messages_to_send
+            )
+
+        try:
+            delivered = await self.txn_ctrl.send(
+                service,
+                events,
+                ephemeral,
+                to_device_messages_to_send,
+                one_time_keys_count,
+                unused_fallback_keys,
+                device_list_summary,
+            )
+            # Spiral patch 0006: the position moves only past what the
+            # service has received; the rest stays in the device inbox.
+            if delivered and to_device_upto is not None:
+                await self.backlog.ack_to_device(service, to_device_upto)
+        except Exception:
+            logger.exception("AS request failed")
 
     async def _compute_msc3202_otk_counts_and_fallback_keys(
         self,
@@ -360,6 +418,9 @@ class _TransactionController:
         # map from service id to recoverer instance
         self.recoverers: dict[str, "_Recoverer"] = {}
 
+        # Spiral patch 0006 (set by the scheduler).
+        self.backlog: "_AppserviceBacklog | None" = None
+
         # for UTs
         self.RECOVERER_CLASS = _Recoverer
 
@@ -372,7 +433,7 @@ class _TransactionController:
         one_time_keys_count: TransactionOneTimeKeysCount | None = None,
         unused_fallback_keys: TransactionUnusedFallbackKeys | None = None,
         device_list_summary: DeviceListUpdates | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Create a transaction with the given data and send to the provided
         application service.
@@ -387,12 +448,16 @@ class _TransactionController:
             unused_fallback_keys: Lists of unused fallback keys for relevant
                 appservice devices in the transaction.
             device_list_summary: The device list summary to include in the transaction.
+
+        Returns:
+            Whether the service received the transaction (Spiral patch 0006).
         """
+        delivered = False
         try:
             service_is_up = await self._is_service_up(service)
             # Don't create empty txns when in recovery mode (ephemeral events are dropped)
             if not service_is_up and not events:
-                return
+                return False
 
             txn = await self.store.create_appservice_txn(
                 service=service,
@@ -406,12 +471,19 @@ class _TransactionController:
             if service_is_up:
                 sent = await txn.send(self.as_api)
                 if sent:
+                    delivered = True
                     await txn.complete(self.store)
                 else:
                     run_in_background(self._on_txn_fail, service)
         except Exception:
             logger.exception("Error creating appservice transaction")
             run_in_background(self._on_txn_fail, service)
+        finally:
+            # Spiral patch 0006: a stored transaction is retried without its
+            # device list changes, so the recoverer sends them.
+            if not delivered and device_list_summary and self.backlog is not None:
+                self.backlog.keep_device_lists(service, device_list_summary)
+        return delivered
 
     async def on_recovered(self, recoverer: "_Recoverer") -> None:
         logger.info(
@@ -422,6 +494,10 @@ class _TransactionController:
         await self.store.set_appservice_state(
             recoverer.service, ApplicationServiceState.UP
         )
+        # Spiral patch 0006: to-device messages that arrived after the
+        # recoverer read the backlog are waiting in the device inbox.
+        if self.backlog is not None and self.backlog.wants_to_device(recoverer.service):
+            self.backlog.queuer.wake_for_to_device(recoverer.service)
 
     async def _on_txn_fail(self, service: ApplicationService) -> None:
         try:
@@ -447,6 +523,7 @@ class _TransactionController:
             service,
             self.on_recovered,
         )
+        recoverer.backlog = self.backlog
         self.recoverers[service.id] = recoverer
         recoverer.recover()
         logger.info("Now %i active recoverers", len(self.recoverers))
@@ -503,6 +580,8 @@ class _Recoverer:
         self.callback = callback
         self.backoff_counter = 1
         self.scheduled_recovery: DelayedCallWrapper | None = None
+        # Spiral patch 0006 (set by the transaction controller).
+        self.backlog: "_AppserviceBacklog | None" = None
 
     def recover(self) -> None:
         delay = Duration(seconds=2**self.backoff_counter)
@@ -538,7 +617,14 @@ class _Recoverer:
     async def retry(self) -> None:
         logger.info("Starting retries on %s", self.service.id)
         try:
-            while True:
+            # Spiral patch 0006: first what the service missed that a stored
+            # transaction does not hold (to-device messages, device list
+            # changes), so that room keys arrive before the events they
+            # decrypt.
+            backlog_sent = self.backlog is None or await self.backlog.send(
+                self.service, self.as_api
+            )
+            while backlog_sent:
                 txn = await self.store.get_oldest_unsent_txn(self.service)
                 if not txn:
                     # nothing left: we're done!
@@ -563,3 +649,164 @@ class _Recoverer:
         # we didn't manage to send all of the transactions before we got an error of
         # some flavour: reschedule the next retry.
         self._backoff()
+
+
+class _AppserviceBacklog:
+    """Spiral patch 0006: what an application service must not lose while
+    Synapse treats it as down.
+
+    A stored transaction holds only its room events, so a transaction that
+    failed is retried without its to-device messages and device list changes,
+    and nothing at all is sent while the service is down except room events.
+    The to-device messages (Megolm room keys among them) were lost for good:
+    the appservice's `to_device` stream position had already moved past them.
+
+    Here the position moves only past messages the service has received: the
+    sender reads them from the device inbox when it sends, and while the
+    service is down its recoverer sends them first, in new transactions of at
+    about `MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION` messages (a page ends on a
+    whole stream id), each device's in stream order. One reader per service at
+    a time (`lock`), so each message is sent once. Device list changes the service did not receive
+    are kept in memory (a set of users, merged) and go with the first of
+    those transactions.
+    """
+
+    def __init__(self, hs: "HomeServer", queuer: _ServiceQueuer):
+        self.store = hs.get_datastores().main
+        self.queuer = queuer
+        self.lock = Linearizer(name="appservice_backlog", clock=hs.get_clock())
+        self._to_device_enabled = (
+            hs.config.experimental.msc2409_to_device_messages_enabled
+        )
+        self._msc3202_enabled = hs.config.experimental.msc3202_transaction_extensions
+        # {service_id: device list changes the service has not received}
+        self._device_lists: dict[str, DeviceListUpdates] = {}
+
+    def wants_to_device(self, service: ApplicationService) -> bool:
+        return self._to_device_enabled and (
+            service.supports_ephemeral or service.supports_unstable_ephemeral
+        )
+
+    def keep_device_lists(
+        self, service: ApplicationService, summary: DeviceListUpdates
+    ) -> None:
+        """Keeps device list changes the service did not receive, after any
+        kept before."""
+        kept = self._device_lists.setdefault(service.id, DeviceListUpdates())
+        _merge_device_lists(kept, summary)
+
+    def _put_back_device_lists(
+        self, service: ApplicationService, summary: DeviceListUpdates
+    ) -> None:
+        """Puts back changes taken for sending, before any kept since."""
+        since = self._device_lists.pop(service.id, None)
+        if since:
+            _merge_device_lists(summary, since)
+        self._device_lists[service.id] = summary
+
+    async def read_to_device(
+        self, service: ApplicationService
+    ) -> tuple[list[JsonMapping], int | None, bool]:
+        """The next to-device messages for the service's users, from the
+        position it has received them up to.
+
+        Returns:
+            The messages (with `to_user_id` / `to_device_id`, per MSC2409), the
+            stream id to store once the service has them (None: nothing new),
+            and whether more are waiting past it.
+        """
+        from_key = await self.store.get_type_stream_id_for_appservice(
+            service, "to_device"
+        )
+        to_key = self.store.get_to_device_stream_token()
+        if to_key <= from_key:
+            return [], None, False
+
+        recipients = await self.store.get_local_to_device_recipients_between(
+            from_key, to_key
+        )
+        users = [user for user in recipients if service.is_interested_in_user(user)]
+        if not users:
+            return [], to_key, False
+
+        upto = await self.store.get_to_device_page_end_for_users(
+            users, from_key, to_key, MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION
+        )
+        by_device = await self.store.get_messages_for_user_devices(
+            users, from_key, upto
+        )
+        messages: list[JsonMapping] = [
+            {"to_user_id": user_id, "to_device_id": device_id, **message}
+            for (user_id, device_id), device_messages in by_device.items()
+            for message in device_messages
+        ]
+        return messages, upto, upto < to_key
+
+    async def ack_to_device(self, service: ApplicationService, upto: int) -> None:
+        await self.store.set_appservice_stream_type_pos(service, "to_device", upto)
+
+    async def send(
+        self, service: ApplicationService, as_api: ApplicationServiceApi
+    ) -> bool:
+        """Sends what the service missed, in new transactions (the service
+        deduplicates by transaction id, so a stored one cannot carry it).
+
+        Returns:
+            Whether the service has received all of it.
+        """
+        async with self.lock.queue(service.id):
+            device_lists = self._device_lists.pop(service.id, DeviceListUpdates())
+            try:
+                more = True
+                while more:
+                    to_device: list[JsonMapping] = []
+                    upto: int | None = None
+                    more = False
+                    if self.wants_to_device(service):
+                        to_device, upto, more = await self.read_to_device(service)
+                    if not to_device and not device_lists:
+                        if upto is not None:
+                            await self.ack_to_device(service, upto)
+                        continue
+
+                    otks: TransactionOneTimeKeysCount = {}
+                    fallback_keys: TransactionUnusedFallbackKeys = {}
+                    if self._msc3202_enabled and service.msc3202_transaction_extensions:
+                        compute = (
+                            self.queuer._compute_msc3202_otk_counts_and_fallback_keys
+                        )
+                        otks, fallback_keys = await compute(service, [], [], to_device)
+
+                    txn = await self.store.create_appservice_txn(
+                        service=service,
+                        events=[],
+                        ephemeral=[],
+                        to_device_messages=to_device,
+                        one_time_keys_count=otks,
+                        unused_fallback_keys=fallback_keys,
+                        device_list_summary=device_lists,
+                    )
+                    try:
+                        sent = await txn.send(as_api)
+                    finally:
+                        # Its content stays here until it is sent, so the stored
+                        # copy (an empty transaction) is never needed.
+                        await txn.complete(self.store)
+                    if not sent:
+                        return False
+
+                    device_lists = DeviceListUpdates()
+                    if upto is not None:
+                        await self.ack_to_device(service, upto)
+                return True
+            finally:
+                if device_lists:
+                    self._put_back_device_lists(service, device_lists)
+
+
+def _merge_device_lists(into: DeviceListUpdates, summary: DeviceListUpdates) -> None:
+    """Merges a later summary into an earlier one, as the sender does."""
+    into.left.difference_update(summary.changed)
+    into.changed.update(summary.changed)
+    into.changed.difference_update(summary.left)
+    into.left.update(summary.left)

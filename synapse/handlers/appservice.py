@@ -393,29 +393,19 @@ class ApplicationServicesHandler:
                         )
 
                     elif stream_key == StreamKeyType.TO_DEVICE:
-                        assert isinstance(new_token, int)
-                        from_key = await self.store.get_type_stream_id_for_appservice(
-                            service, "to_device"
-                        )
-                        # Spiral patch 0004: notifications do not arrive in
-                        # stream order with respect to the messages they
-                        # carry, so one behind the position has nothing left
-                        # to send, and must not move the position back (which
-                        # would send the range again).
-                        if new_token <= from_key:
-                            continue
-
-                        to_device_messages = await self._get_to_device_messages(
-                            service, from_key, new_token
-                        )
-                        self.scheduler.enqueue_for_appservice(
-                            service, to_device_messages=to_device_messages
-                        )
-
-                        # Persist the latest handled stream token for this appservice
-                        await self.store.set_appservice_stream_type_pos(
-                            service, "to_device", new_token
-                        )
+                        # Spiral patch 0006: the scheduler reads the messages
+                        # from the device inbox when it sends, from the
+                        # position the appservice has received them up to,
+                        # and stores the position once it has them. Reading
+                        # here and storing the position at once lost every
+                        # message the appservice did not receive (it was
+                        # down, or the transaction failed).
+                        #
+                        # Spiral patch 0004 (now in the scheduler's read):
+                        # every recipient in the range, not just this
+                        # notification's `users`, and up to the stream's
+                        # persisted position, not this notification's token.
+                        self.scheduler.wake_for_to_device(service)
 
                     elif stream_key == StreamKeyType.DEVICE_LIST:
                         assert isinstance(new_token, int)
@@ -562,75 +552,6 @@ class ApplicationServicesHandler:
             )
 
         return events
-
-    async def _get_to_device_messages(
-        self,
-        service: ApplicationService,
-        from_key: int,
-        new_token: int,
-    ) -> list[JsonDict]:
-        """
-        Given an application service, determine which events it should receive
-        from those between the last-recorded to-device message stream token for this
-        appservice and the given stream token.
-
-        Args:
-            service: The application service to check for which events it should receive.
-            from_key: The to-device stream position the appservice has
-                processed up to (exclusive).
-            new_token: The latest to-device event stream token (inclusive).
-
-        Returns:
-            A list of JSON dictionaries containing data derived from the to-device events
-                that should be sent to the given application service.
-        """
-        # Spiral patch 0004: every recipient in the range, not just the
-        # `users` of the notification being handled. A send notifies with the
-        # stream's persisted-up-to token, which is below its own stream id
-        # while a lower id is still being written. Its notification then
-        # reads up to a token short of its own message, and the notification
-        # of the lower id's send — whose `users` are that send's recipients
-        # only — takes the position past it. Reading the recipients from the
-        # range itself delivers each message in the range exactly once.
-        recipients = await self.store.get_local_to_device_recipients_between(
-            from_key, new_token
-        )
-        users_appservice_is_interested_in = [
-            user for user in recipients if service.is_interested_in_user(user)
-        ]
-
-        if not users_appservice_is_interested_in:
-            # Return early if the AS was not interested in any of these users
-            return []
-
-        # Retrieve the to-device messages for each user
-        recipient_device_to_messages = await self.store.get_messages_for_user_devices(
-            users_appservice_is_interested_in,
-            from_key,
-            new_token,
-        )
-
-        # According to MSC2409, we'll need to add 'to_user_id' and 'to_device_id' fields
-        # to the event JSON so that the application service will know which user/device
-        # combination this messages was intended for.
-        #
-        # So we mangle this dict into a flat list of to-device messages with the relevant
-        # user ID and device ID embedded inside each message dict.
-        message_payload: list[JsonDict] = []
-        for (
-            user_id,
-            device_id,
-        ), messages in recipient_device_to_messages.items():
-            for message_json in messages:
-                message_payload.append(
-                    {
-                        "to_user_id": user_id,
-                        "to_device_id": device_id,
-                        **message_json,
-                    }
-                )
-
-        return message_payload
 
     async def _get_device_list_summary(
         self,
