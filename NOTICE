@@ -18,4 +18,4 @@ upstream tag v1.158.0, one commit each, and one module, spiral/modules/; `git lo
 and `git diff v1.158.0` shows every change. The modified work is
 distributed under the same licence. It is the source of the homeserver
 Spiral's users reach over the network (AGPL-3.0 section 13): the image
-tagged v1.158.0-spiral.7, built with spiral/Dockerfile.
+tagged v1.158.0-spiral.8, built with spiral/Dockerfile.
