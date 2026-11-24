@@ -244,6 +244,12 @@ def _load_appservice(
                 "The `io.element.msc4512.proxy_url` option should be a non-empty string."
             )
 
+    spiral_hold_presence = as_info.get("com.spiral.hold_presence", False)
+    if not isinstance(spiral_hold_presence, bool):
+        raise ValueError(
+            "The `com.spiral.hold_presence` option should be true or false if specified."
+        )
+
     return ApplicationService(
         token=as_info["as_token"],
         url=as_info["url"],
@@ -261,4 +267,5 @@ def _load_appservice(
         scopes=scopes,
         proxy_prefix=proxy_prefix,
         proxy_url=proxy_url,
+        spiral_hold_presence=spiral_hold_presence,
     )

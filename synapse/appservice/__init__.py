@@ -120,6 +120,7 @@ class ApplicationService:
         scopes: Iterable[str] = frozenset(),
         proxy_prefix: str | None = None,
         proxy_url: str | None = None,
+        spiral_hold_presence: bool = False,
     ):
         self.token = token
         self.url = (
@@ -152,6 +153,8 @@ class ApplicationService:
         self.supports_ephemeral = supports_ephemeral
         self.msc3202_transaction_extensions = msc3202_transaction_extensions
         self.msc4190_device_management = msc4190_device_management
+        # Spiral: this service's exclusive users keep the presence they set.
+        self.spiral_hold_presence = spiral_hold_presence
 
         if "|" in self.id:
             raise Exception("application service ID cannot contain '|' character")
