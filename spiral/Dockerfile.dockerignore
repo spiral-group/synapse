@@ -1,0 +1,8 @@
+# The build context for spiral/Dockerfile (Docker reads this file instead of
+# the repository's .dockerignore when building with -f spiral/Dockerfile):
+# only what the recipe copies, the Python package and the module.
+*
+!synapse
+!spiral/modules/spiral_post_guard.py
+synapse/*.so
+**/__pycache__
