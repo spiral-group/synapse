@@ -707,6 +707,44 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             db_autocommit=True,  # A single read.
         )
 
+    async def get_to_device_page_end_for_users(
+        self,
+        user_ids: Collection[str],
+        from_stream_id: int,
+        to_stream_id: int,
+        limit: int,
+    ) -> int:
+        """The end of the next page of to-device messages to the given users:
+        the stream id of their `limit`-th message in the range
+        (from < X <= to), or `to_stream_id` if they have fewer.
+
+        A page ends on a whole stream id (one send to many devices shares one),
+        so it can hold more than `limit` messages when a single send does.
+
+        Spiral patch 0006: an appservice reads its backlog a page at a time.
+        """
+        if not user_ids or to_stream_id <= from_stream_id:
+            return to_stream_id
+
+        def get_to_device_page_end_for_users_txn(txn: LoggingTransaction) -> int:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "user_id", user_ids
+            )
+            txn.execute(
+                f"SELECT stream_id FROM device_inbox WHERE {clause}"
+                " AND ? < stream_id AND stream_id <= ?"
+                " ORDER BY stream_id ASC LIMIT 1 OFFSET ?",
+                (*args, from_stream_id, to_stream_id, limit - 1),
+            )
+            row = txn.fetchone()
+            return to_stream_id if row is None else int(row[0])
+
+        return await self.db_pool.runInteraction(
+            "get_to_device_page_end_for_users",
+            get_to_device_page_end_for_users_txn,
+            db_autocommit=True,  # A single read.
+        )
+
     async def get_all_new_device_messages(
         self, instance_name: str, last_id: int, current_id: int, limit: int
     ) -> tuple[list[tuple[int, tuple]], int, bool]:
