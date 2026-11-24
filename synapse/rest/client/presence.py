@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING
 
 from synapse.api.errors import AuthError, Codes, LimitExceededError, SynapseError
 from synapse.api.ratelimiting import Ratelimiter
-from synapse.handlers.presence import format_user_presence_state
+from synapse.handlers.presence import (
+    format_user_presence_state,
+    spiral_coarse_presence,
+    spiral_presence_hidden_between,
+)
 from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseRequest
@@ -76,9 +80,16 @@ class PresenceStatusRestServlet(RestServlet):
                 raise AuthError(403, "You are not allowed to see their presence.")
 
         state = await self.presence_handler.get_state(target_user=user)
-        result = format_user_presence_state(
-            state, self.clock.time_msec(), include_user_id=False
-        )
+        now = self.clock.time_msec()
+        # Spiral (ADR-0084): exact presence only if neither side hides theirs.
+        if await spiral_presence_hidden_between(
+            self.hs.get_datastores().main,
+            self.hs.hostname,
+            observed=user.to_string(),
+            observer=requester.user.to_string(),
+        ):
+            return 200, spiral_coarse_presence(state, now)
+        result = format_user_presence_state(state, now, include_user_id=False)
 
         return 200, result
 
